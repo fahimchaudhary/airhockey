@@ -106,12 +106,12 @@ class AirHockeyEnv(gym.Env):
         self.p2 = np.array([W / 2, 130.0])       # opponent (top)
         self.v1 = np.zeros(2)
         self.v2 = np.zeros(2)
-        # Randomize initial puck position slightly for diversity
+        serve_side = float(self.rng.choice([-1, 1]))
         self.puck = np.array([
-            W / 2 + self.rng.uniform(-30, 30),
-            H / 2,
-            self.rng.uniform(-3, 3),
-            float(self.rng.choice([-6, -4, 4, 6])),
+            W / 2 + self.rng.uniform(-25, 25),
+            H / 2 + serve_side * 75.0,
+            self.rng.uniform(-1.5, 1.5),
+            float(self.rng.choice([-5, -3, 0, 0, 3, 5])),
         ])
         self.t = 0
         self.frame_stack.clear()
@@ -349,13 +349,19 @@ class RuleAI:
         if self.timer >= p["think"]:
             self.timer = 0
             if py < H / 2:
-                base = self.predict_x(px, py, vx, vy, self.pos[1]) if vy < 0 else px
+                if py < self.pos[1] + 10:
+                    self.tx = self.pos[0] - (PR + PUCK_R + 15) if px > W / 2 else self.pos[0] + (PR + PUCK_R + 15)
+                    self.ty = max(self.pos[1], 110.0)
+                else:
+                    base = self.predict_x(px, py, vx, vy, clamp(self.pos[1] + 25, PR, H / 2 - PR)) if vy < -0.5 else px
+                    self.tx = base + (random.random() * 2 - 1) * p["noise"]
+                    self.ty = clamp(py + PR + 12, PR, H / 2 - PR)
             else:
-                base = W/2 + (px - W/2) * p["defend"]
-            self.tx = base + (random.random()*2-1) * p["noise"]
-            self.ty = clamp(py-(PR+PUCK_R)*p["aggr"], PR, H/2-PR) if py<H/2 else 110.0
-        nx = self.pos[0] + clamp(self.tx-self.pos[0], -p["speed"], p["speed"])
-        ny = self.pos[1] + clamp(self.ty-self.pos[1], -p["speed"]*.8, p["speed"]*.8)
+                base = W / 2 + (px - W / 2) * p["defend"]
+                self.tx = base + (random.random() * 2 - 1) * (p["noise"] * 0.4)
+                self.ty = 110.0 + (py / H) * 20.0
+        nx = self.pos[0] + clamp(self.tx - self.pos[0], -p["speed"], p["speed"])
+        ny = self.pos[1] + clamp(self.ty - self.pos[1], -p["speed"] * 0.9, p["speed"] * 0.9)
         self.vel = np.array([nx-self.pos[0], ny-self.pos[1]])
         self.pos = np.array([clamp(nx,PR,W-PR), clamp(ny,PR,H/2-PR)])
         return self.pos.copy(), self.vel.copy()

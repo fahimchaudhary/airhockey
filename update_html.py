@@ -327,7 +327,7 @@ function drawTrail() {
 // ═══ STATE ═══
 let state = 'menu', mode = 'medium';
 let scores = [0, 0];
-let serveTimer = 0, serveDir = 1;
+let serveTimer = 0, serveDir = 1, stagnantTimer = 0;
 const puck    = { x: W/2, y: H/2, vx: 0, vy: 0 };
 const human   = { x: W/2, y: H-130, vx: 0, vy: 0 };
 const ai      = { x: W/2, y: 130,   vx: 0, vy: 0, timer: 0, tx: W/2, ty: 130 };
@@ -466,11 +466,17 @@ function showMenu(title, sub) {
   hudEl.style.display  = 'none';
 }
 function resetPositions(dir) {
-  puck.x=W/2; puck.y=H/2; puck.vx=0; puck.vy=0;
-  serveTimer=60; serveDir=dir;
-  human.x=W/2; human.y=H-130; human.vx=0; human.vy=0;
-  ai.x=W/2; ai.y=130; ai.vx=0; ai.vy=0; ai.timer=0;
-  pointer.x=W/2; pointer.y=H-130; pointer.active=false;
+  serveDir = dir;
+  puck.x = W / 2;
+  // Place puck cleanly in the serving player's zone — completely stationary (no ghost auto-fire)
+  puck.y = dir === -1 ? H / 2 - 75 : H / 2 + 75;
+  puck.vx = 0;
+  puck.vy = 0;
+  serveTimer = 20;
+  stagnantTimer = 0;
+  human.x = W / 2; human.y = H - 130; human.vx = 0; human.vy = 0;
+  ai.x = W / 2; ai.y = 120; ai.vx = 0; ai.vy = 0; ai.timer = 0;
+  pointer.x = W / 2; pointer.y = H - 130; pointer.active = false;
   proFrameStack = [];  // Reset frame stack on position reset
 }
 function updateHUD() {
@@ -487,6 +493,7 @@ function goal(humanScored) {
     showMenu(won?'🏆 YOU WIN!':'🤖 AI WINS', `${scores[0]} – ${scores[1]}. Rematch?`);
     return;
   }
+  // The player who got scored on gets the next serve
   resetPositions(humanScored ? -1 : 1);
 }
 
@@ -501,8 +508,21 @@ function predictX(p, y) {
 }
 
 function updateAI() {
-  if (mode==='pro' && AI_NET) {
-    // Pro AI: Deep Reinforcement Learning with temporal frame stacking
+  const pSpd = Math.hypot(puck.vx, puck.vy);
+
+  if (mode === 'pro' && AI_NET) {
+    // Pro AI: If puck is in AI's half and stationary or slow, proactively drive in and smash it!
+    if (puck.y < H / 2 - 10 && pSpd < 1.0 && puck.y >= ai.y - 15) {
+      ai.tx = puck.x;
+      ai.ty = clamp(puck.y + PR + 12, PR, H / 2 - PR);
+      const nx = ai.x + clamp(ai.tx - ai.x, -MALLET_SPEED, MALLET_SPEED);
+      const ny = ai.y + clamp(ai.ty - ai.y, -MALLET_SPEED * 0.9, MALLET_SPEED * 0.9);
+      ai.vx = nx - ai.x; ai.vy = ny - ai.y;
+      ai.x = clamp(nx, PR, W - PR); ai.y = clamp(ny, PR, H / 2 - PR);
+      return;
+    }
+
+    // Otherwise Deep Reinforcement Learning with temporal frame stacking
     const obs = proStackedObs();
     const a = netAct(obs);
     if (a) {
@@ -513,37 +533,51 @@ function updateAI() {
     }
     return;
   }
+
+  // Easy / Medium / Hard AI Logic
   const p = DIFF[mode] || DIFF.hard;
   ai.timer++;
   if (ai.timer >= p.think) {
     ai.timer = 0;
+
     if (puck.y < H / 2) {
-      // Puck is in AI's defensive/attacking half
+      // Puck is in AI's territory!
       if (puck.y < ai.y + 10) {
-        // Puck is behind the mallet near goal!
-        // Anti-hallucination / self-goal protection: never hit puck toward own goal
+        // Puck is BEHIND mallet near goal!
+        // Evasive lateral dodge so AI NEVER knocks puck into its own goal
         if (Math.abs(puck.x - ai.x) < PR + PUCK_R + 15) {
-          ai.tx = puck.x > W / 2 ? puck.x - (PR + PUCK_R + 12) : puck.x + (PR + PUCK_R + 12);
+          ai.tx = puck.x > W / 2 ? puck.x - (PR + PUCK_R + 15) : puck.x + (PR + PUCK_R + 15);
         } else {
-          ai.tx = W / 2 + (puck.x - W / 2) * 0.4;
+          ai.tx = W / 2 + (puck.x - W / 2) * 0.3;
         }
         ai.ty = Math.max(ai.y, 110);
       } else {
-        // Puck is in front of the mallet: intercept & strike forward
-        const interceptY = clamp(ai.y, PR + 10, H / 2 - PR);
-        const base = puck.vy < 0 ? predictX(puck, interceptY) : puck.x;
-        ai.tx = base + (Math.random() * 2 - 1) * p.noise;
-        ai.ty = clamp(puck.y - (PR + PUCK_R) * p.aggr, PR, H / 2 - PR);
+        // Puck is in FRONT of mallet: STRIKE AND ATTACK!
+        let hitX = puck.x;
+        if (puck.vy < -0.5) {
+          // Puck coming fast towards AI: calculate wall bounce reflection
+          const interceptY = clamp(ai.y + 25, PR + 10, H / 2 - PR);
+          hitX = predictX(puck, interceptY);
+        } else {
+          // Puck is stationary, slow, or floating: aim towards opponent goal corners
+          const cornerTarget = puck.x < W / 2 ? (W / 2 + 50) : (W / 2 - 50);
+          hitX = puck.x + (puck.x - cornerTarget) * 0.12;
+        }
+
+        ai.tx = clamp(hitX + (Math.random() * 2 - 1) * p.noise, PR, W - PR);
+        // CRUCIAL FIX: Target THROUGH the puck (puck.y + PR + 12) so mallet drives INTO puck at full speed!
+        ai.ty = clamp(puck.y + PR + 12, PR, H / 2 - PR);
       }
     } else {
-      // Puck is in human player's half: maintain strategic defensive formation
+      // Puck is in Human player's territory: hold strategic defensive formation
       const targetBase = W / 2 + (puck.x - W / 2) * p.defend;
-      ai.tx = targetBase + (Math.random() * 2 - 1) * (p.noise * 0.5);
+      ai.tx = clamp(targetBase + (Math.random() * 2 - 1) * (p.noise * 0.4), PR, W - PR);
       ai.ty = 110 + (puck.y / H) * 20;
     }
   }
+
   const nx = ai.x + clamp(ai.tx - ai.x, -p.speed, p.speed);
-  const ny = ai.y + clamp(ai.ty - ai.y, -p.speed * 0.85, p.speed * 0.85);
+  const ny = ai.y + clamp(ai.ty - ai.y, -p.speed * 0.9, p.speed * 0.9);
   ai.vx = nx - ai.x; ai.vy = ny - ai.y;
   ai.x = clamp(nx, PR, W - PR); ai.y = clamp(ny, PR, H / 2 - PR);
 }
@@ -566,31 +600,47 @@ function collide(p) {
   }
 }
 function updatePuck() {
-  puck.vx*=0.995; puck.vy*=0.995;
-  puck.x+=puck.vx; puck.y+=puck.vy;
-  if(puck.x<PUCK_R){
-    puck.x=PUCK_R; puck.vx=-puck.vx*.9;
+  puck.vx *= 0.995; puck.vy *= 0.995;
+  puck.x += puck.vx; puck.y += puck.vy;
+
+  // Stagnant dead-ball watchdog
+  const pSpd = Math.hypot(puck.vx, puck.vy);
+  if (pSpd < 0.25) {
+    stagnantTimer++;
+    // If puck has been completely abandoned in human court for > 5 seconds, award serve to AI
+    if (stagnantTimer > 320 && puck.y >= H / 2) {
+      stagnantTimer = 0;
+      resetPositions(-1); // Give serve to AI
+      playSound('serve');
+      spawnParticles(puck.x, puck.y, '#78b4ff', 15, 4);
+    }
+  } else {
+    stagnantTimer = 0;
+  }
+
+  if (puck.x < PUCK_R) {
+    puck.x = PUCK_R; puck.vx = -puck.vx * 0.9;
     playSound('wall');
     spawnParticles(puck.x, puck.y, '#78b4ff', 4, 3);
   }
-  if(puck.x>W-PUCK_R){
-    puck.x=W-PUCK_R; puck.vx=-puck.vx*.9;
+  if (puck.x > W - PUCK_R) {
+    puck.x = W - PUCK_R; puck.vx = -puck.vx * 0.9;
     playSound('wall');
     spawnParticles(puck.x, puck.y, '#78b4ff', 4, 3);
   }
-  const inMouth=Math.abs(puck.x-W/2)<GOAL_W/2;
-  if(puck.y<PUCK_R&&!inMouth){
-    puck.y=PUCK_R; puck.vy=-puck.vy*.9;
+  const inMouth = Math.abs(puck.x - W / 2) < GOAL_W / 2;
+  if (puck.y < PUCK_R && !inMouth) {
+    puck.y = PUCK_R; puck.vy = -puck.vy * 0.9;
     playSound('wall');
     spawnParticles(puck.x, puck.y, '#78b4ff', 4, 3);
   }
-  if(puck.y>H-PUCK_R&&!inMouth){
-    puck.y=H-PUCK_R; puck.vy=-puck.vy*.9;
+  if (puck.y > H - PUCK_R && !inMouth) {
+    puck.y = H - PUCK_R; puck.vy = -puck.vy * 0.9;
     playSound('wall');
     spawnParticles(puck.x, puck.y, '#78b4ff', 4, 3);
   }
-  if(puck.y<-PUCK_R){goal(true);return;}
-  if(puck.y>H+PUCK_R){goal(false);return;}
+  if (puck.y < -PUCK_R) { goal(true); return; }
+  if (puck.y > H + PUCK_R) { goal(false); return; }
 }
 function updateHuman() {
   const tx=clamp(pointer.x,PR,W-PR), ty=clamp(pointer.y,H/2+PR,H-PR);
@@ -599,18 +649,16 @@ function updateHuman() {
   human.vx=human.x-ox; human.vy=human.y-oy;
 }
 function update() {
-  if(state!=='play') return;
-  updateHuman(); updateAI();
-  if(serveTimer>0){
+  if (state !== 'play') return;
+  if (serveTimer > 0) {
     serveTimer--;
-    if(serveTimer===0){
-      puck.vx=(Math.random()-.5)*3; puck.vy=serveDir*6;
-      playSound('serve');
-    }
   }
+  updateHuman();
+  updateAI();
   updatePuck();
-  if(state!=='play') return;
-  collide(human); collide(ai);
+  if (state !== 'play') return;
+  collide(human);
+  collide(ai);
 }
 
 // ═══ RENDERING ═══
@@ -684,10 +732,16 @@ function drawMallet(x,y,color,glow){
   ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2); ctx.fill();
 }
 function drawServeRing(){
-  if(serveTimer<=0) return;
-  const prog=1-serveTimer/60;
-  ctx.save(); ctx.strokeStyle='rgba(255,255,255,.3)'; ctx.lineWidth=3;
-  ctx.beginPath(); ctx.arc(W/2,H/2,78,-Math.PI/2,-Math.PI/2+prog*Math.PI*2); ctx.stroke(); ctx.restore();
+  const pSpd = Math.hypot(puck.vx, puck.vy);
+  if (pSpd > 0.4) return;
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.006);
+  ctx.save();
+  ctx.strokeStyle = puck.y < H / 2 ? 'rgba(0,200,255,' + (0.25 + pulse * 0.35) + ')' : 'rgba(255,58,92,' + (0.25 + pulse * 0.35) + ')';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(puck.x, puck.y, PUCK_R + 8 + pulse * 6, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
 }
 function draw(){
   ctx.setTransform(scale*dpr,0,0,scale*dpr,0,0);

@@ -154,6 +154,7 @@ const PUCK_R = 18;
 const WIN = 7;
 const MAX_PUCK_SPEED = 26;
 const MALLET_SPEED = 12;
+const N_FRAMES = 3;  // frame stacking count
 
 const canvas      = document.getElementById('c');
 const ctx         = canvas.getContext('2d');
@@ -334,13 +335,16 @@ const pointer = { x: W/2, y: H-130, active: false };
 
 // ═══ DIFFICULTY ═══
 const DIFF = {
-  easy:   { speed: 4.2, think: 28, noise: 70, aggr: 0.25, defend: 0.6 },
-  medium: { speed: 6.0, think: 12, noise: 28, aggr: 0.50, defend: 0.4 },
-  hard:   { speed: 9.5, think: 2,  noise: 6,  aggr: 0.90, defend: 0.2 },
+  easy:   { speed: 5.0, think: 14, noise: 25, aggr: 0.35, defend: 0.55 },
+  medium: { speed: 7.2, think: 7,  noise: 10, aggr: 0.65, defend: 0.35 },
+  hard:   { speed: 10.5, think: 2,  noise: 2,  aggr: 0.95, defend: 0.15 },
 };
 
-// ═══ PRO AI — MLP forward pass ═══
+// ═══ PRO AI — MLP forward pass with frame stacking ═══
 let AI_NET = null;
+// Frame stack buffer for Pro AI (stores last N_FRAMES of 8-dim observations)
+let proFrameStack = [];
+
 async function loadProAI() {
   try {
     const r = await fetch('ai_weights.json');
@@ -381,11 +385,48 @@ function netAct(obs) {
   }
   return x.map(v => clamp(v, -1, 1));
 }
-function proObs() {
+
+/**
+ * Build a single 8-dim observation frame for the Pro AI (from AI's perspective).
+ * The AI is at the top, so we flip Y coordinates.
+ */
+function proRawObs() {
   return [
     puck.x/W*2-1, (H-puck.y)/H*2-1, puck.vx/MAX_PUCK_SPEED, -puck.vy/MAX_PUCK_SPEED,
     ai.x/W*2-1, (H-ai.y)/H*2-1, human.x/W*2-1, (H-human.y)/H*2-1,
   ];
+}
+
+/**
+ * Build frame-stacked observation for the Pro AI.
+ * If the network expects 24 inputs (3 frames × 8), we stack.
+ * If the network expects 8 inputs (legacy), we just use the raw obs.
+ */
+function proStackedObs() {
+  const raw = proRawObs();
+  // Auto-detect: check if the first layer expects stacked input
+  const expectedInputDim = AI_NET && AI_NET.layers.length > 0 ? AI_NET.layers[0].W[0].length : 8;
+
+  if (expectedInputDim <= 8) {
+    // Legacy model: no frame stacking needed
+    return raw;
+  }
+
+  // Frame-stacked model
+  proFrameStack.push(raw);
+  while (proFrameStack.length < N_FRAMES) {
+    proFrameStack.unshift(raw.slice());  // pad with copies
+  }
+  if (proFrameStack.length > N_FRAMES) {
+    proFrameStack = proFrameStack.slice(-N_FRAMES);
+  }
+
+  // Concatenate all frames
+  const stacked = [];
+  for (const frame of proFrameStack) {
+    for (const v of frame) stacked.push(v);
+  }
+  return stacked;
 }
 
 // ═══ INPUT ═══
@@ -409,6 +450,7 @@ function startMatch(m) {
   initAudio();
   mode = m; scores = [0,0]; state = 'play';
   particles.length = 0; trail.length = 0;
+  proFrameStack = [];  // Reset frame stack
   resetPositions(Math.random() < 0.5 ? 1 : -1);
   menuEl.style.display = 'none';
   hudEl.style.display  = 'flex';
@@ -429,6 +471,7 @@ function resetPositions(dir) {
   human.x=W/2; human.y=H-130; human.vx=0; human.vy=0;
   ai.x=W/2; ai.y=130; ai.vx=0; ai.vy=0; ai.timer=0;
   pointer.x=W/2; pointer.y=H-130; pointer.active=false;
+  proFrameStack = [];  // Reset frame stack on position reset
 }
 function updateHUD() {
   scoreAiEl.textContent  = scores[1];
@@ -456,29 +499,53 @@ function predictX(p, y) {
   if(u<0) u+=2*span; if(u>span) u=2*span-u;
   return min+u;
 }
+
 function updateAI() {
   if (mode==='pro' && AI_NET) {
-    const a=netAct(proObs());
-    const ox=ai.x, oy=ai.y;
-    ai.x=clamp(ai.x+a[0]*MALLET_SPEED, PR, W-PR);
-    ai.y=clamp(ai.y-a[1]*MALLET_SPEED, PR, H/2-PR);
-    ai.vx=ai.x-ox; ai.vy=ai.y-oy;
+    // Pro AI: Deep Reinforcement Learning with temporal frame stacking
+    const obs = proStackedObs();
+    const a = netAct(obs);
+    if (a) {
+      const ox = ai.x, oy = ai.y;
+      ai.x = clamp(ai.x + a[0] * MALLET_SPEED, PR, W - PR);
+      ai.y = clamp(ai.y - a[1] * MALLET_SPEED, PR, H / 2 - PR);
+      ai.vx = ai.x - ox; ai.vy = ai.y - oy;
+    }
     return;
   }
-  const p=DIFF[mode]||DIFF.hard;
+  const p = DIFF[mode] || DIFF.hard;
   ai.timer++;
-  if (ai.timer>=p.think) {
-    ai.timer=0;
-    let base = puck.y<H/2
-      ? (puck.vy<0?predictX(puck,ai.y):puck.x)
-      : W/2+(puck.x-W/2)*p.defend;
-    ai.tx=base+(Math.random()*2-1)*p.noise;
-    ai.ty=puck.y<H/2?clamp(puck.y-(PR+PUCK_R)*p.aggr,PR,H/2-PR):110;
+  if (ai.timer >= p.think) {
+    ai.timer = 0;
+    if (puck.y < H / 2) {
+      // Puck is in AI's defensive/attacking half
+      if (puck.y < ai.y + 10) {
+        // Puck is behind the mallet near goal!
+        // Anti-hallucination / self-goal protection: never hit puck toward own goal
+        if (Math.abs(puck.x - ai.x) < PR + PUCK_R + 15) {
+          ai.tx = puck.x > W / 2 ? puck.x - (PR + PUCK_R + 12) : puck.x + (PR + PUCK_R + 12);
+        } else {
+          ai.tx = W / 2 + (puck.x - W / 2) * 0.4;
+        }
+        ai.ty = Math.max(ai.y, 110);
+      } else {
+        // Puck is in front of the mallet: intercept & strike forward
+        const interceptY = clamp(ai.y, PR + 10, H / 2 - PR);
+        const base = puck.vy < 0 ? predictX(puck, interceptY) : puck.x;
+        ai.tx = base + (Math.random() * 2 - 1) * p.noise;
+        ai.ty = clamp(puck.y - (PR + PUCK_R) * p.aggr, PR, H / 2 - PR);
+      }
+    } else {
+      // Puck is in human player's half: maintain strategic defensive formation
+      const targetBase = W / 2 + (puck.x - W / 2) * p.defend;
+      ai.tx = targetBase + (Math.random() * 2 - 1) * (p.noise * 0.5);
+      ai.ty = 110 + (puck.y / H) * 20;
+    }
   }
-  const nx=ai.x+clamp(ai.tx-ai.x,-p.speed,p.speed);
-  const ny=ai.y+clamp(ai.ty-ai.y,-p.speed*.8,p.speed*.8);
-  ai.vx=nx-ai.x; ai.vy=ny-ai.y;
-  ai.x=clamp(nx,PR,W-PR); ai.y=clamp(ny,PR,H/2-PR);
+  const nx = ai.x + clamp(ai.tx - ai.x, -p.speed, p.speed);
+  const ny = ai.y + clamp(ai.ty - ai.y, -p.speed * 0.85, p.speed * 0.85);
+  ai.vx = nx - ai.x; ai.vy = ny - ai.y;
+  ai.x = clamp(nx, PR, W - PR); ai.y = clamp(ny, PR, H / 2 - PR);
 }
 
 // ═══ PHYSICS ═══

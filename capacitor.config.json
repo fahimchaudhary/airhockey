@@ -1,0 +1,9 @@
+{
+  "appId": "com.example.airhockey",
+  "appName": "Air Hockey",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": true
+  }
+}

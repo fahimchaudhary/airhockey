@@ -1,4 +1,4 @@
-import json
+import json, os
 
 with open('/home/fahim/game/ai_weights.json') as f:
     weights_json = f.read().strip()
@@ -328,6 +328,7 @@ function drawTrail() {
 let state = 'menu', mode = 'medium';
 let scores = [0, 0];
 let serveTimer = 0, serveDir = 1, stagnantTimer = 0;
+let serveBannerText = '';
 const puck    = { x: W/2, y: H/2, vx: 0, vy: 0 };
 const human   = { x: W/2, y: H-130, vx: 0, vy: 0 };
 const ai      = { x: W/2, y: 130,   vx: 0, vy: 0, timer: 0, tx: W/2, ty: 130 };
@@ -451,7 +452,7 @@ function startMatch(m) {
   mode = m; scores = [0,0]; state = 'play';
   particles.length = 0; trail.length = 0;
   proFrameStack = [];  // Reset frame stack
-  resetPositions(Math.random() < 0.5 ? 1 : -1);
+  resetPositions('center');  // Game ki starting me ball strictly CENTRE me rahegi!
   menuEl.style.display = 'none';
   hudEl.style.display  = 'flex';
   modeBadge.textContent = m.toUpperCase();
@@ -465,15 +466,25 @@ function showMenu(title, sub) {
   menuEl.style.display = 'flex';
   hudEl.style.display  = 'none';
 }
-function resetPositions(dir) {
-  serveDir = dir;
+function resetPositions(placement) {
+  serveDir = placement;
   puck.x = W / 2;
-  // Place puck cleanly in the serving player's zone — completely stationary (no ghost auto-fire)
-  puck.y = dir === -1 ? H / 2 - 75 : H / 2 + 75;
+  if (placement === 'center') {
+    // Starting match: ball strictly in center!
+    puck.y = H / 2;
+    serveBannerText = 'READY!';
+  } else if (placement === 'ai' || placement === -1) {
+    // User scored: ball shifts to Bot area (Bot serve)
+    puck.y = H / 2 - 80;
+    serveBannerText = 'BOT SERVE';
+  } else {
+    // Bot scored: ball shifts to User area (User serve)
+    puck.y = H / 2 + 80;
+    serveBannerText = 'YOUR SERVE';
+  }
   puck.vx = 0;
   puck.vy = 0;
-  serveTimer = 20;
-  stagnantTimer = 0;
+  serveTimer = placement === 'center' ? 50 : 70; // Stopped pause duration (~0.85s - 1.2s)
   human.x = W / 2; human.y = H - 130; human.vx = 0; human.vy = 0;
   ai.x = W / 2; ai.y = 120; ai.vx = 0; ai.vy = 0; ai.timer = 0;
   pointer.x = W / 2; pointer.y = H - 130; pointer.active = false;
@@ -493,8 +504,8 @@ function goal(humanScored) {
     showMenu(won?'🏆 YOU WIN!':'🤖 AI WINS', `${scores[0]} – ${scores[1]}. Rematch?`);
     return;
   }
-  // The player who got scored on gets the next serve
-  resetPositions(humanScored ? -1 : 1);
+  // When goal scored: ball shifts to conceding side and is STOPPED until serveTimer finishes
+  resetPositions(humanScored ? 'ai' : 'human');
 }
 
 // ═══ AI ═══
@@ -509,77 +520,104 @@ function predictX(p, y) {
 
 function updateAI() {
   const pSpd = Math.hypot(puck.vx, puck.vy);
+  const puckInAiHalf = puck.y < H / 2;
 
-  if (mode === 'pro' && AI_NET) {
-    // Pro AI: If puck is in AI's half and stationary or slow, proactively drive in and smash it!
-    if (puck.y < H / 2 - 10 && pSpd < 1.0 && puck.y >= ai.y - 15) {
-      ai.tx = puck.x;
-      ai.ty = clamp(puck.y + PR + 12, PR, H / 2 - PR);
-      const nx = ai.x + clamp(ai.tx - ai.x, -MALLET_SPEED, MALLET_SPEED);
-      const ny = ai.y + clamp(ai.ty - ai.y, -MALLET_SPEED * 0.9, MALLET_SPEED * 0.9);
-      ai.vx = nx - ai.x; ai.vy = ny - ai.y;
-      ai.x = clamp(nx, PR, W - PR); ai.y = clamp(ny, PR, H / 2 - PR);
-      return;
+  // ═══════════════════════════════════════════════════════════════════
+  // ZONE A: PUCK IS IN USER HALF (DEFENSE MODE)
+  // When user doesn't perform any action or puck is in user area:
+  // Bot stays in focused, steady DEFENSE MODE without hallucinating/twitching!
+  // ═══════════════════════════════════════════════════════════════════
+  if (!puckInAiHalf) {
+    // If puck is shot towards AI: calculate wall bounce reflections and intercept!
+    if (puck.vy < -0.8) {
+      const interceptY = clamp(ai.y + 25, PR + 10, H / 2 - PR);
+      ai.tx = clamp(predictX(puck, interceptY), PR + 15, W - PR - 15);
+      ai.ty = 120 + clamp(-puck.vy * 2.5, 0, 40);
+    } else {
+      // User is idle or passing in user half: maintain focused defensive guard
+      // Align X smoothly with puck to guard the goal mouth without twitching
+      const targetBase = W / 2 + (puck.x - W / 2) * 0.65;
+      ai.tx = clamp(targetBase, PR + 25, W - PR - 25);
+      ai.ty = 120; // Stable home defensive line
     }
 
-    // Otherwise Deep Reinforcement Learning with temporal frame stacking
-    const obs = proStackedObs();
-    const a = netAct(obs);
-    if (a) {
-      const ox = ai.x, oy = ai.y;
-      ai.x = clamp(ai.x + a[0] * MALLET_SPEED, PR, W - PR);
-      ai.y = clamp(ai.y - a[1] * MALLET_SPEED, PR, H / 2 - PR);
-      ai.vx = ai.x - ox; ai.vy = ai.y - oy;
-    }
+    // Move smoothly without random jitter
+    const spd = (mode === 'pro') ? MALLET_SPEED * 0.75 : (DIFF[mode] || DIFF.hard).speed * 0.75;
+    const nx = ai.x + clamp(ai.tx - ai.x, -spd, spd);
+    const ny = ai.y + clamp(ai.ty - ai.y, -spd, spd);
+    ai.vx = nx - ai.x; ai.vy = ny - ai.y;
+    ai.x = clamp(nx, PR, W - PR);
+    ai.y = clamp(ny, PR, H / 2 - PR);
     return;
   }
 
-  // Easy / Medium / Hard AI Logic
-  const p = DIFF[mode] || DIFF.hard;
-  ai.timer++;
-  if (ai.timer >= p.think) {
-    ai.timer = 0;
+  // ═══════════════════════════════════════════════════════════════════
+  // ZONE B: PUCK IS IN AGENT HALF (ATTACK MODE)
+  // The moment the ball enters agent area, AI immediately starts action!
+  // ═══════════════════════════════════════════════════════════════════
 
-    if (puck.y < H / 2) {
-      // Puck is in AI's territory!
-      if (puck.y < ai.y + 10) {
-        // Puck is BEHIND mallet near goal!
-        // Evasive lateral dodge so AI NEVER knocks puck into its own goal
-        if (Math.abs(puck.x - ai.x) < PR + PUCK_R + 15) {
-          ai.tx = puck.x > W / 2 ? puck.x - (PR + PUCK_R + 15) : puck.x + (PR + PUCK_R + 15);
-        } else {
-          ai.tx = W / 2 + (puck.x - W / 2) * 0.3;
-        }
-        ai.ty = Math.max(ai.y, 110);
-      } else {
-        // Puck is in FRONT of mallet: STRIKE AND ATTACK!
-        let hitX = puck.x;
-        if (puck.vy < -0.5) {
-          // Puck coming fast towards AI: calculate wall bounce reflection
-          const interceptY = clamp(ai.y + 25, PR + 10, H / 2 - PR);
-          hitX = predictX(puck, interceptY);
-        } else {
-          // Puck is stationary, slow, or floating: aim towards opponent goal corners
-          const cornerTarget = puck.x < W / 2 ? (W / 2 + 50) : (W / 2 - 50);
-          hitX = puck.x + (puck.x - cornerTarget) * 0.12;
-        }
-
-        ai.tx = clamp(hitX + (Math.random() * 2 - 1) * p.noise, PR, W - PR);
-        // CRUCIAL FIX: Target THROUGH the puck (puck.y + PR + 12) so mallet drives INTO puck at full speed!
-        ai.ty = clamp(puck.y + PR + 12, PR, H / 2 - PR);
-      }
+  // Sub-case 1: Puck is behind or level with mallet near goal (avoid own goal)
+  if (puck.y < ai.y + 12) {
+    if (Math.abs(puck.x - ai.x) < PR + PUCK_R + 15) {
+      ai.tx = puck.x > W / 2 ? puck.x - (PR + PUCK_R + 18) : puck.x + (PR + PUCK_R + 18);
     } else {
-      // Puck is in Human player's territory: hold strategic defensive formation
-      const targetBase = W / 2 + (puck.x - W / 2) * p.defend;
-      ai.tx = clamp(targetBase + (Math.random() * 2 - 1) * (p.noise * 0.4), PR, W - PR);
-      ai.ty = 110 + (puck.y / H) * 20;
+      ai.tx = W / 2 + (puck.x - W / 2) * 0.3;
+    }
+    ai.ty = Math.max(ai.y, 110);
+    const spd = (mode === 'pro') ? MALLET_SPEED : (DIFF[mode] || DIFF.hard).speed;
+    const nx = ai.x + clamp(ai.tx - ai.x, -spd, spd);
+    const ny = ai.y + clamp(ai.ty - ai.y, -spd, spd);
+    ai.vx = nx - ai.x; ai.vy = ny - ai.y;
+    ai.x = clamp(nx, PR, W - PR);
+    ai.y = clamp(ny, PR, H / 2 - PR);
+    return;
+  }
+
+  // Sub-case 2: Pro Mode (Deep RL with Attack Forward Enforcement)
+  if (mode === 'pro' && AI_NET) {
+    const obs = proStackedObs();
+    const a = netAct(obs);
+    if (a) {
+      let moveX = a[0] * MALLET_SPEED;
+      let moveY = -a[1] * MALLET_SPEED;
+
+      // Attack guarantee: if puck is in front, mallet must drive forward towards/through the puck!
+      const toPuckY = (puck.y + PR + 14) - ai.y;
+      if (toPuckY > 5 && moveY < 2.5) {
+        moveY = Math.min(MALLET_SPEED, Math.max(moveY, toPuckY * 0.5));
+      }
+      const toPuckX = puck.x - ai.x;
+      if (Math.abs(toPuckX) > 12 && (moveX * toPuckX < 0)) {
+        moveX = clamp(toPuckX * 0.45, -MALLET_SPEED, MALLET_SPEED);
+      }
+
+      const ox = ai.x, oy = ai.y;
+      ai.x = clamp(ai.x + moveX, PR, W - PR);
+      ai.y = clamp(ai.y + moveY, PR, H / 2 - PR);
+      ai.vx = ai.x - ox; ai.vy = ai.y - oy;
+      return;
     }
   }
 
+  // Easy / Medium / Hard Attack Strike:
+  const p = DIFF[mode] || DIFF.hard;
+  let hitX = puck.x;
+  if (puck.vy < -0.5) {
+    const interceptY = clamp(ai.y + 25, PR + 10, H / 2 - PR);
+    hitX = predictX(puck, interceptY);
+  } else {
+    // Cut shot aimed at opponent goal corners
+    const cornerTarget = puck.x < W / 2 ? (W / 2 + 55) : (W / 2 - 55);
+    hitX = puck.x + (puck.x - cornerTarget) * 0.16;
+  }
+  ai.tx = clamp(hitX, PR, W - PR);
+  ai.ty = clamp(puck.y + PR + 14, PR, H / 2 - PR); // Smash into puck!
+
   const nx = ai.x + clamp(ai.tx - ai.x, -p.speed, p.speed);
-  const ny = ai.y + clamp(ai.ty - ai.y, -p.speed * 0.9, p.speed * 0.9);
+  const ny = ai.y + clamp(ai.ty - ai.y, -p.speed, p.speed);
   ai.vx = nx - ai.x; ai.vy = ny - ai.y;
-  ai.x = clamp(nx, PR, W - PR); ai.y = clamp(ny, PR, H / 2 - PR);
+  ai.x = clamp(nx, PR, W - PR);
+  ai.y = clamp(ny, PR, H / 2 - PR);
 }
 
 // ═══ PHYSICS ═══
@@ -602,21 +640,6 @@ function collide(p) {
 function updatePuck() {
   puck.vx *= 0.995; puck.vy *= 0.995;
   puck.x += puck.vx; puck.y += puck.vy;
-
-  // Stagnant dead-ball watchdog
-  const pSpd = Math.hypot(puck.vx, puck.vy);
-  if (pSpd < 0.25) {
-    stagnantTimer++;
-    // If puck has been completely abandoned in human court for > 5 seconds, award serve to AI
-    if (stagnantTimer > 320 && puck.y >= H / 2) {
-      stagnantTimer = 0;
-      resetPositions(-1); // Give serve to AI
-      playSound('serve');
-      spawnParticles(puck.x, puck.y, '#78b4ff', 15, 4);
-    }
-  } else {
-    stagnantTimer = 0;
-  }
 
   if (puck.x < PUCK_R) {
     puck.x = PUCK_R; puck.vx = -puck.vx * 0.9;
@@ -652,6 +675,12 @@ function update() {
   if (state !== 'play') return;
   if (serveTimer > 0) {
     serveTimer--;
+    // Ball and mallets are completely STOPPED during serve timer!
+    puck.vx = 0; puck.vy = 0;
+    ai.vx = 0; ai.vy = 0;
+    human.vx = 0; human.vy = 0;
+    if (serveTimer === 0) playSound('serve');
+    return; // Strictly stop physics, AI, and collision while stopped!
   }
   updateHuman();
   updateAI();
@@ -736,11 +765,38 @@ function drawServeRing(){
   if (pSpd > 0.4) return;
   const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.006);
   ctx.save();
-  ctx.strokeStyle = puck.y < H / 2 ? 'rgba(0,200,255,' + (0.25 + pulse * 0.35) + ')' : 'rgba(255,58,92,' + (0.25 + pulse * 0.35) + ')';
+  const ringColor = Math.abs(puck.y - H / 2) < 20 
+    ? 'rgba(255,255,255,' + (0.25 + pulse * 0.35) + ')' 
+    : (puck.y < H / 2 ? 'rgba(0,200,255,' + (0.25 + pulse * 0.35) + ')' : 'rgba(255,58,92,' + (0.25 + pulse * 0.35) + ')');
+  ctx.strokeStyle = ringColor;
   ctx.lineWidth = 2.5;
   ctx.beginPath();
   ctx.arc(puck.x, puck.y, PUCK_R + 8 + pulse * 6, 0, Math.PI * 2);
   ctx.stroke();
+  ctx.restore();
+}
+function drawServeBanner(){
+  if (serveTimer <= 0 || !serveBannerText) return;
+  ctx.save();
+  ctx.font = '900 15px Orbitron, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const alpha = Math.min(1.0, serveTimer / 15);
+  ctx.globalAlpha = alpha;
+
+  const isCenter = Math.abs(puck.y - H / 2) < 20;
+  const col = isCenter ? '#ffffff' : (puck.y < H / 2 ? '#00c8ff' : '#ff3a5c');
+  ctx.fillStyle = 'rgba(3, 7, 18, 0.82)';
+  roundRect(W / 2 - 130, H / 2 - 22, 260, 44, 12);
+  ctx.fill();
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.fillStyle = col;
+  ctx.shadowColor = col;
+  ctx.shadowBlur = 14;
+  ctx.fillText(serveBannerText, W / 2, H / 2);
   ctx.restore();
 }
 function draw(){
@@ -749,6 +805,7 @@ function draw(){
   drawTable(); drawTrail(); drawServeRing(); drawParticles(); drawPuck();
   drawMallet(ai.x,ai.y,'#00c8ff','#00c8ff');
   drawMallet(human.x,human.y,'#ff3a5c','#ff3a5c');
+  drawServeBanner();
 }
 
 // ═══ LOOP ═══
@@ -772,8 +829,16 @@ requestAnimationFrame(frame);
 
 final_html = template.replace('__WEIGHTS_JSON__', weights_json)
 
-for path in ['/home/fahim/game/Air Hockey.html', '/home/fahim/game/air-hockey.html', '/home/fahim/game/www/index.html']:
-    with open(path, 'w') as f:
-        f.write(final_html)
+paths = [
+    '/home/fahim/game/Air Hockey.html',
+    '/home/fahim/game/air-hockey.html',
+    '/home/fahim/game/www/index.html',
+    '/home/fahim/game/android/app/src/main/assets/public/index.html'
+]
+
+for path in paths:
+    if os.path.exists(os.path.dirname(path)):
+        with open(path, 'w') as f:
+            f.write(final_html)
 
 print('Successfully generated and written perfected HTML files!')
